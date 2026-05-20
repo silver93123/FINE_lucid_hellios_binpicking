@@ -581,7 +581,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    # 설정 파일 로드
+    # Camera 설정 파일 로드
     with args.config.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
