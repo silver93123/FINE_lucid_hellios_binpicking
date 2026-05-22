@@ -73,7 +73,13 @@ from src.detection import RTMDetInferencer  # noqa: E402
 # ── Detection ─────────────────────────────────────────────────────────────────
 WORK_DIR        = ROOT / "work_dirs" / "rtmdet-ins_bracket_v1"
 CONFIG_PATH     = WORK_DIR / "rtmdet-ins_bracket.py"
-CHECKPOINT_PATH = WORK_DIR / "best_coco_bbox_mAP_epoch_50.pth"
+
+# best_*.pth 자동 탐색 (epoch 수 무관)
+_candidates = sorted(WORK_DIR.glob("best_*.pth"))
+if not _candidates:
+    print(f"ERROR: best 모델이 없습니다: {WORK_DIR}", flush=True)
+    sys.exit(1)
+CHECKPOINT_PATH = _candidates[-1] 
 
 SCORE_THRESHOLD         = 0.3
 MIN_POINTS_PER_INSTANCE = 100
