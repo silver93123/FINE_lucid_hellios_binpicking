@@ -86,7 +86,7 @@ CHECKPOINT_PATH = _candidates[-1]
 
 SCORE_THRESHOLD        = 0.3
 MIN_POINTS_PER_INSTANCE = 100
-MASK_IOU_THRESHOLD     = 0.5
+MASK_IOU_THRESHOLD     = 0.65
 
 # ── ICP ───────────────────────────────────────────────────────────────────────
 CAD_PATH           = ROOT / "data" / "cad" / "bracket_v2.stl"
@@ -102,7 +102,7 @@ ICP_STAGES = [
     {"max_dist": 0.005, "max_iter": 100},
 ]
 
-ICP_FITNESS_THRESHOLD = 0.5
+ICP_FITNESS_THRESHOLD = 0.7
 XYZ_MAX_M             = 2.0
 CAD_AXIS_CORRECTION_DEG = (0, 90, 90)
 
@@ -123,13 +123,13 @@ ICP_YAW_RANGE   = (-45.0, 45.0)  # [deg] yaw 는 360° 자유 (필요 시 좁히
 
 # ── 픽포인트 ──────────────────────────────────────────────────────────────────
 CAD_PICK_LOCAL   = np.array([0.000, -0.100, 0.031, 1.0])
-PICK_OFFSET_X_MM =  15.0
-PICK_OFFSET_Y_MM =  15.0
+PICK_OFFSET_X_MM =  5.0
+PICK_OFFSET_Y_MM =  7.0
 PICK_OFFSET_Z_MM =  0.0
 
 # 오버레이 십자선 2D 위치 = ICP 역탐색 픽셀 * (1 - W) + 마스크 중심 픽셀 * W
 # 0.0 = ICP 100%,  1.0 = 마스크 중심 100%
-PICK_2D_MASK_WEIGHT = 0.7   # 마스크 중심 비율 (ICP 30% + 마스크 70%)
+PICK_2D_MASK_WEIGHT = 0.5   # 마스크 중심 비율 (ICP 30% + 마스크 70%)
 
 # ── TCP 서버 ──────────────────────────────────────────────────────────────────
 TCP_HOST = "192.168.0.22"  # 비전 PC IP (로봇이 접속하는 주소)
@@ -284,6 +284,34 @@ def pick_to_pixel(pick_mm: list, pcd_organized: np.ndarray,
         return fallback_xy
 
     return int(vc[idx]), int(vr[idx])   # (px, py) = (col, row)
+
+
+def pixel_to_point(px: float, py: float, pcd_organized: np.ndarray,
+                   valid_mask: np.ndarray) -> np.ndarray | None:
+    """픽셀 좌표(px, py)에 대응하는 3D 포인트(mm)를 organized PCD에서 조회.
+
+    해당 픽셀이 invalid(깊이 없음)면, valid 픽셀 중 2D 거리상 가장 가까운
+    픽셀의 3D 값을 대신 사용한다 (마스크 중심이 depth hole에 걸리는 경우 대비).
+
+    pcd_organized : (H, W, 3) float32, mm 단위
+    valid_mask    : (H, W) bool
+
+    Returns:
+        (3,) ndarray, mm 단위. valid 픽셀이 전혀 없으면 None.
+    """
+    H, W = pcd_organized.shape[:2]
+    ix = int(round(px)); ix = min(max(ix, 0), W - 1)
+    iy = int(round(py)); iy = min(max(iy, 0), H - 1)
+
+    if valid_mask[iy, ix]:
+        return pcd_organized[iy, ix].astype(np.float64).copy()
+
+    vr, vc = np.where(valid_mask)
+    if len(vr) == 0:
+        return None
+    d2  = (vr - iy) ** 2 + (vc - ix) ** 2
+    idx = int(np.argmin(d2))
+    return pcd_organized[vr[idx], vc[idx]].astype(np.float64).copy()
 
 
 def draw_picks_on_overlay(image_bgr: np.ndarray, picks_2d: list) -> np.ndarray:
@@ -730,13 +758,38 @@ def transform_to_pose(T):
         "transform_matrix": T.tolist(),
     }
 
-def compute_pick_point(T):
-    pl = CAD_PICK_LOCAL.copy()
-    pl[0] += PICK_OFFSET_X_MM / 1000.0
-    pl[1] += PICK_OFFSET_Y_MM / 1000.0
-    pl[2] += PICK_OFFSET_Z_MM / 1000.0
-    wt  = T @ pl
-    pos = (wt[:3] * 1000.0).tolist()
+def compute_pick_point(T, pcd_organized: np.ndarray = None,
+                       valid_mask: np.ndarray = None,
+                       cx_2d: float = None, cy_2d: float = None):
+    """최종 픽포인트(로봇 전송 + 시각화 공용) 계산.
+
+    순서:
+      1) ICP 픽포인트  = CAD_PICK_LOCAL 을 T 로 변환 (offset 미포함)
+      2) 2D 픽포인트   = 마스크 중심 픽셀(cx_2d, cy_2d)에 대응하는 실측 3D 포인트
+      3) 블렌딩        = ICP*(1-W) + 2D*W   (W = PICK_2D_MASK_WEIGHT)
+      4) offset 적용   = 블렌딩 결과 + PICK_OFFSET_*_MM
+
+    pcd_organized/valid_mask/cx_2d/cy_2d 중 하나라도 없으면 2D 포인트를
+    구할 수 없으므로 ICP 결과만 사용한다(offset은 그대로 적용됨).
+    """
+    pl_icp     = CAD_PICK_LOCAL.copy()           # offset 미포함
+    wt_icp     = T @ pl_icp
+    pos_icp_mm = wt_icp[:3] * 1000.0             # (3,) ICP 픽포인트, mm
+
+    pt2d_mm = None
+    if (pcd_organized is not None and valid_mask is not None
+            and cx_2d is not None and cy_2d is not None):
+        pt2d_mm = pixel_to_point(cx_2d, cy_2d, pcd_organized, valid_mask)
+
+    w = PICK_2D_MASK_WEIGHT
+    if pt2d_mm is not None:
+        pos_blend_mm = pos_icp_mm * (1.0 - w) + pt2d_mm * w
+    else:
+        pos_blend_mm = pos_icp_mm                # 2D 정보 없으면 ICP 100%
+
+    pos_final_mm = pos_blend_mm + np.array(
+        [PICK_OFFSET_X_MM, PICK_OFFSET_Y_MM, PICK_OFFSET_Z_MM])
+
     R   = T[:3, :3]
     pitch = float(np.degrees(np.arctan2(-R[2, 0], np.sqrt(R[0, 0]**2 + R[1, 0]**2))))
     cp    = np.cos(np.radians(pitch))
@@ -746,10 +799,14 @@ def compute_pick_point(T):
     else:
         roll, yaw = 0.0, float(np.degrees(np.arctan2(-R[0, 1], R[1, 1])))
     return {
-        "position_mm":  [round(v, 3) for v in pos],
+        "position_mm":  [round(v, 3) for v in pos_final_mm.tolist()],
         "approach_deg": {"roll_deg":  round(roll,  4),
                          "pitch_deg": round(pitch, 4),
                          "yaw_deg":   round(yaw,   4)},
+        # 디버그/로그용 중간값
+        "_pos_icp_mm":   pos_icp_mm.tolist(),
+        "_pos_2d_mm":    None if pt2d_mm is None else pt2d_mm.tolist(),
+        "_pos_blend_mm": pos_blend_mm.tolist(),
     }
 
 def build_icp_elements(scene_pcd, cad_pcd, T, pick, inst_color):
@@ -845,25 +902,30 @@ def run_icp_for_frame(instance_plys, cad_pcd, cad_down,
 
         # ── 정상 결과 처리 ───────────────────────────────────────────────
         pose = transform_to_pose(T)
-        pick = compute_pick_point(T)
+        # 최종 픽포인트 = (ICP 픽포인트, 2D 마스크중심 실측 픽포인트) 블렌딩 → offset 적용
+        # 이 값이 로봇 전송 좌표와 시각화(2D 크로스헤어 / 3D 구) 좌표에 동일하게 쓰인다.
+        pick = compute_pick_point(T, pcd_organized=pcd_organized,
+                                  valid_mask=valid_mask, cx_2d=cx_2d, cy_2d=cy_2d)
         ppos = pick["position_mm"]
         deg  = pick["approach_deg"]
 
         inst_color   = _PALETTE_RGB_FLOAT[inst_idx % len(_PALETTE_RGB_FLOAT)].tolist()
         combined_pcd += build_icp_elements(scene_pcd, cad_pcd, T, pick, inst_color)
-        # 오버레이 2D 위치: ICP 역탐색 픽셀 * (1-W) + 마스크 중심 픽셀 * W
+
+        # 오버레이 2D 크로스헤어: 최종(블렌딩+offset) 3D 좌표를 다시 픽셀로 역투영
         if pcd_organized is not None and valid_mask is not None:
-            icp_px, icp_py = pick_to_pixel(
+            px_2d, py_2d = pick_to_pixel(
                 pick["position_mm"], pcd_organized, valid_mask,
                 fallback_xy=(int(cx_2d), int(cy_2d)))
         else:
-            icp_px, icp_py = int(cx_2d), int(cy_2d)
+            px_2d, py_2d = int(cx_2d), int(cy_2d)
+
         w = PICK_2D_MASK_WEIGHT
-        px_2d = int(round(icp_px * (1.0 - w) + cx_2d * w))
-        py_2d = int(round(icp_py * (1.0 - w) + cy_2d * w))
-        log(f"   2D 픽포인트: ICP({icp_px},{icp_py}) x{1-w:.0%}"
-            f" + 마스크({int(cx_2d)},{int(cy_2d)}) x{w:.0%}"
-            f" = ({px_2d},{py_2d})")
+        log(f"   픽포인트: ICP{tuple(round(v,1) for v in pick['_pos_icp_mm'])}"
+            f" x{1-w:.0%} + 2D{None if pick['_pos_2d_mm'] is None else tuple(round(v,1) for v in pick['_pos_2d_mm'])} x{w:.0%}"
+            f" = 블렌딩{tuple(round(v,1) for v in pick['_pos_blend_mm'])}"
+            f" + offset({PICK_OFFSET_X_MM},{PICK_OFFSET_Y_MM},{PICK_OFFSET_Z_MM})"
+            f" = 최종{tuple(ppos)}  →  px,py=({px_2d},{py_2d})")
         picks_2d.append((px_2d, py_2d, pick, float(fit), bbox))
 
         result = {
